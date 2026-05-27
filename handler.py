@@ -3,15 +3,23 @@ RunPod Serverless Handler for Gemma 4 26B-A4B-it via llama.cpp
 
 Downloads the GGUF model on first boot (cached on network volume),
 starts llama-server, and proxies OpenAI-compatible requests.
+
+Patched: wraps init in try/except so any failure (HF download, llama-server
+crash, volume permissions) is captured and returned in the job response
+instead of silently killing the worker.
 """
 
 import json
 import os
+import shutil
 import subprocess
+import sys
 import time
+import traceback
 
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
-os.environ["HF_HUB_DISABLE_XET"] = "1"
+# Allow xet downloads by default (override via env if needed)
+os.environ.setdefault("HF_HUB_DISABLE_XET", "0")
 
 import requests
 import runpod
@@ -28,8 +36,49 @@ PARALLEL = int(os.environ.get("PARALLEL", "1"))
 BASE_URL = f"http://127.0.0.1:{LLAMA_PORT}"
 
 
+def diagnostic_snapshot() -> dict:
+    """Capture environment state for crash reports."""
+    snap = {
+        "model_repo": MODEL_REPO,
+        "model_file": MODEL_FILE,
+        "model_dir": MODEL_DIR,
+        "ctx_size": CTX_SIZE,
+        "n_gpu_layers": N_GPU_LAYERS,
+        "parallel": PARALLEL,
+        "env_hf_xet_disable": os.environ.get("HF_HUB_DISABLE_XET"),
+        "python": sys.version.split()[0],
+    }
+    # Disk
+    try:
+        usage = shutil.disk_usage("/")
+        snap["disk_root_free_gb"] = round(usage.free / (1024**3), 2)
+        snap["disk_root_total_gb"] = round(usage.total / (1024**3), 2)
+    except Exception as e:
+        snap["disk_root_err"] = str(e)
+    # Volume
+    snap["volume_exists"] = os.path.isdir("/runpod-volume")
+    if snap["volume_exists"]:
+        try:
+            usage = shutil.disk_usage("/runpod-volume")
+            snap["volume_free_gb"] = round(usage.free / (1024**3), 2)
+            snap["volume_total_gb"] = round(usage.total / (1024**3), 2)
+            snap["volume_writable"] = os.access("/runpod-volume", os.W_OK)
+        except Exception as e:
+            snap["volume_err"] = str(e)
+    # CUDA
+    try:
+        r = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10)
+        snap["nvidia_smi"] = r.stdout.strip()[:300]
+    except Exception as e:
+        snap["nvidia_smi_err"] = str(e)
+    # llama-server binary
+    snap["llama_server_exists"] = os.path.isfile("/app/llama-server")
+    if snap["llama_server_exists"]:
+        snap["llama_server_executable"] = os.access("/app/llama-server", os.X_OK)
+    return snap
+
+
 def ensure_model() -> str:
-    """Download the GGUF if not already present. Returns the local path."""
     os.makedirs(MODEL_DIR, exist_ok=True)
     local_path = os.path.join(MODEL_DIR, MODEL_FILE)
 
@@ -50,7 +99,6 @@ def ensure_model() -> str:
 
 
 def start_llama_server(model_path: str):
-    """Launch llama-server and block until it reports healthy."""
     cmd = [
         "/app/llama-server",
         "-m", model_path,
@@ -70,12 +118,25 @@ def start_llama_server(model_path: str):
     )
 
     deadline = time.time() + 300
+    stdout_tail = []
     while time.time() < deadline:
         if proc.poll() is not None:
-            stdout = proc.stdout.read().decode() if proc.stdout else ""
+            try:
+                stdout = proc.stdout.read().decode() if proc.stdout else ""
+            except Exception:
+                stdout = ""
             raise RuntimeError(
-                f"llama-server exited with code {proc.returncode}:\n{stdout}"
+                f"llama-server exited with code {proc.returncode}:\n{stdout[-3000:]}"
             )
+        # Drain stdout non-blocking-ish so we can capture tail on hang
+        try:
+            line = proc.stdout.readline() if proc.stdout else b""
+            if line:
+                stdout_tail.append(line.decode(errors="replace"))
+                if len(stdout_tail) > 200:
+                    stdout_tail = stdout_tail[-200:]
+        except Exception:
+            pass
 
         try:
             r = requests.get(f"{BASE_URL}/health", timeout=2)
@@ -89,22 +150,39 @@ def start_llama_server(model_path: str):
 
         time.sleep(1)
 
-    proc.kill()
-    raise RuntimeError("llama-server failed to become healthy within 300s")
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    tail = "".join(stdout_tail[-50:])
+    raise RuntimeError(f"llama-server failed to become healthy within 300s. Tail:\n{tail}")
 
 
-print("Ensuring model is available...")
-model_path = ensure_model()
-
-print("Initializing llama-server...")
-server_proc = start_llama_server(model_path)
+# ---- Init phase, wrapped to surface failures via the handler ----
+INIT_ERROR = None
+INIT_DIAG = None
+model_path = None
+server_proc = None
+try:
+    print("=== Init phase: capturing diagnostic snapshot ===")
+    INIT_DIAG = diagnostic_snapshot()
+    print(json.dumps(INIT_DIAG, indent=2))
+    print("Ensuring model is available...")
+    model_path = ensure_model()
+    print("Initializing llama-server...")
+    server_proc = start_llama_server(model_path)
+    print("=== Init complete ===")
+except Exception:
+    INIT_ERROR = traceback.format_exc()
+    print("=" * 60)
+    print("HANDLER INIT FAILED:")
+    print(INIT_ERROR)
+    print("=" * 60)
 
 
 def _forward(job_input):
-    """Send request to llama-server and return the response object."""
     endpoint = job_input.pop("endpoint", "/v1/chat/completions")
     stream = job_input.get("stream", False)
-
     resp = requests.post(
         f"{BASE_URL}{endpoint}",
         json=job_input,
@@ -116,7 +194,12 @@ def _forward(job_input):
 
 
 def handler(job):
-    """Sync handler for non-streaming requests."""
+    if INIT_ERROR:
+        return {
+            "error": "WORKER_INIT_FAILED",
+            "init_traceback": INIT_ERROR,
+            "diag": INIT_DIAG,
+        }
     job_input = job["input"]
     try:
         resp, _ = _forward(job_input)
@@ -126,7 +209,9 @@ def handler(job):
 
 
 def stream_handler(job):
-    """Streaming handler that yields SSE chunks."""
+    if INIT_ERROR:
+        yield {"error": "WORKER_INIT_FAILED", "init_traceback": INIT_ERROR, "diag": INIT_DIAG}
+        return
     job_input = job["input"]
     job_input["stream"] = True
     try:
