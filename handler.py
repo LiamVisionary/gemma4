@@ -17,6 +17,15 @@ import sys
 import time
 import traceback
 
+# Per-phase timing for cold-start diagnosis. All times monotonic seconds.
+_MODULE_START = time.monotonic()
+PHASE_TIMES = {"module_import": 0.0}
+
+def _phase(name):
+    """Record a timestamp relative to module import."""
+    PHASE_TIMES[name] = round(time.monotonic() - _MODULE_START, 3)
+    print(f"[PHASE {PHASE_TIMES[name]:.3f}s] {name}")
+
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 # Allow xet downloads by default (override via env if needed)
 os.environ.setdefault("HF_HUB_DISABLE_XET", "0")
@@ -169,13 +178,17 @@ INIT_DIAG = None
 model_path = None
 server_proc = None
 try:
+    _phase("init_start")
     print("=== Init phase: capturing diagnostic snapshot ===")
     INIT_DIAG = diagnostic_snapshot()
+    _phase("diag_done")
     print(json.dumps(INIT_DIAG, indent=2))
     print("Ensuring model is available...")
     model_path = ensure_model()
+    _phase("model_ready")
     print("Initializing llama-server...")
     server_proc = start_llama_server(model_path)
+    _phase("llama_server_healthy")
     print("=== Init complete ===")
 except Exception:
     INIT_ERROR = traceback.format_exc()
@@ -198,19 +211,41 @@ def _forward(job_input):
     return resp, stream
 
 
+_FIRST_JOB_RECEIVED = None
+
+def _build_meta():
+    """Diagnostic metadata attached to every response."""
+    meta = {
+        "phase_times": dict(PHASE_TIMES),
+        "first_job_received_s": _FIRST_JOB_RECEIVED,
+        "uptime_at_response_s": round(time.monotonic() - _MODULE_START, 3),
+        "gpu": (INIT_DIAG or {}).get("nvidia_smi", "?"),
+    }
+    return meta
+
 def handler(job):
+    global _FIRST_JOB_RECEIVED
+    if _FIRST_JOB_RECEIVED is None:
+        _FIRST_JOB_RECEIVED = round(time.monotonic() - _MODULE_START, 3)
+        _phase("first_job_received")
     if INIT_ERROR:
         return {
             "error": "WORKER_INIT_FAILED",
             "init_traceback": INIT_ERROR,
             "diag": INIT_DIAG,
+            "_meta": _build_meta(),
         }
     job_input = job["input"]
+    # Strip _meta_request from input if present (debug flag opt-in; non-breaking)
+    job_input.pop("_meta_request", None)
     try:
         resp, _ = _forward(job_input)
-        return resp.json()
+        body = resp.json()
+        if isinstance(body, dict):
+            body["_meta"] = _build_meta()
+        return body
     except requests.RequestException as e:
-        return {"error": str(e)}
+        return {"error": str(e), "_meta": _build_meta()}
 
 
 def stream_handler(job):
@@ -238,6 +273,7 @@ def stream_handler(job):
             continue
 
 
+_phase("runpod_start_called")
 runpod.serverless.start({
     "handler": handler,
     "return_aggregate_stream": True,
