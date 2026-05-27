@@ -107,6 +107,11 @@ def start_llama_server(model_path: str):
         "-c", str(CTX_SIZE),
         "--parallel", str(PARALLEL),
         "--host", "127.0.0.1",
+        # Enable jinja chat template evaluation so the model's embedded
+        # chat_template.jinja is used. For SuperGemma4, this enables
+        # the enable_thinking=false default (skip CoT for normal turns)
+        # and unlocks chat_template_kwargs in request bodies.
+        "--jinja",
     ]
 
     print(f"Starting llama-server: {' '.join(cmd)}")
