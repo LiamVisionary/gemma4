@@ -29,6 +29,11 @@ def _phase(name):
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 # Allow xet downloads by default (override via env if needed)
 os.environ.setdefault("HF_HUB_DISABLE_XET", "0")
+# Point HuggingFace cache at RunPod's cached-models stage area so we read
+# pre-staged files from local NVMe instead of downloading via network volume.
+# RunPod's "Cached Models" feature populates this when the endpoint's
+# modelName field is set on the platform side.
+os.environ.setdefault("HF_HOME", "/runpod-volume/huggingface-cache")
 
 import requests
 import runpod
@@ -88,20 +93,42 @@ def diagnostic_snapshot() -> dict:
 
 
 def ensure_model() -> str:
+    """Resolve the model file path, preferring RunPod's Cached Models
+    stage area (local NVMe via /runpod-volume/huggingface-cache) before
+    our own MODEL_DIR (network volume).
+
+    Strategy:
+      1. If HF cache already has the file (RunPod pre-cached it), use it.
+      2. If our MODEL_DIR copy exists (legacy), use that.
+      3. Otherwise hf_hub_download — which itself checks HF cache first
+         before pulling from the network.
+    """
     os.makedirs(MODEL_DIR, exist_ok=True)
-    local_path = os.path.join(MODEL_DIR, MODEL_FILE)
+    legacy_path = os.path.join(MODEL_DIR, MODEL_FILE)
 
-    if os.path.isfile(local_path):
-        size_gb = os.path.getsize(local_path) / (1024 ** 3)
-        print(f"Model already cached: {local_path} ({size_gb:.1f} GB)")
-        return local_path
+    # Pass 1: try resolving via HF cache (covers RunPod-pre-cached case
+    # and our own prior hf_hub_download call). cache_dir defaults to HF_HOME.
+    try:
+        cached = hf_hub_download(
+            repo_id=MODEL_REPO,
+            filename=MODEL_FILE,
+            local_files_only=True,  # don't download, just check cache
+        )
+        size_gb = os.path.getsize(cached) / (1024 ** 3)
+        print(f"Model from HF cache (local NVMe): {cached} ({size_gb:.1f} GB)")
+        return cached
+    except Exception as cache_err:
+        print(f"HF cache miss ({cache_err.__class__.__name__}: {str(cache_err)[:100]})")
 
-    print(f"Downloading {MODEL_REPO}/{MODEL_FILE} to {MODEL_DIR}...")
-    downloaded = hf_hub_download(
-        repo_id=MODEL_REPO,
-        filename=MODEL_FILE,
-        local_dir=MODEL_DIR,
-    )
+    # Pass 2: legacy /runpod-volume/models path
+    if os.path.isfile(legacy_path):
+        size_gb = os.path.getsize(legacy_path) / (1024 ** 3)
+        print(f"Model from legacy MODEL_DIR (network volume): {legacy_path} ({size_gb:.1f} GB)")
+        return legacy_path
+
+    # Pass 3: download from HF (slow path)
+    print(f"Downloading {MODEL_REPO}/{MODEL_FILE} via hf_hub_download...")
+    downloaded = hf_hub_download(repo_id=MODEL_REPO, filename=MODEL_FILE)
     size_gb = os.path.getsize(downloaded) / (1024 ** 3)
     print(f"Download complete: {downloaded} ({size_gb:.1f} GB)")
     return downloaded
