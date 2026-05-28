@@ -35,6 +35,7 @@ os.environ.setdefault("HF_HUB_DISABLE_XET", "0")
 # volume attached, it lands on the (slow) network volume — so this endpoint
 # must run WITHOUT a network volume to get the speedup.
 HF_CACHE_ROOT = "/runpod-volume/huggingface-cache/hub"
+_MODEL_SOURCE = None  # "cache" | "legacy" | "download" — set by ensure_model()
 
 import requests
 import runpod
@@ -139,6 +140,7 @@ def ensure_model() -> str:
         if os.path.isfile(candidate):
             size_gb = os.path.getsize(candidate) / (1024 ** 3)
             print(f"[cache HIT] {candidate} ({size_gb:.1f} GB)")
+            globals()["_MODEL_SOURCE"] = "cache"
             return candidate
         # GGUF may be symlinked under blobs/; resolve_snapshot_path returns the
         # snapshot dir which contains symlinks to blobs — os.path.isfile follows them.
@@ -146,6 +148,7 @@ def ensure_model() -> str:
             if f == MODEL_FILE:
                 p = os.path.join(snap, f)
                 print(f"[cache HIT via listdir] {p}")
+                globals()["_MODEL_SOURCE"] = "cache"
                 return p
         print(f"[cache MISS] snapshot dir exists but {MODEL_FILE} not in it: {os.listdir(snap)[:10]}")
     except Exception as e:
@@ -156,6 +159,7 @@ def ensure_model() -> str:
     if os.path.isfile(legacy_path):
         size_gb = os.path.getsize(legacy_path) / (1024 ** 3)
         print(f"[legacy] {legacy_path} ({size_gb:.1f} GB)")
+        globals()["_MODEL_SOURCE"] = "legacy"
         return legacy_path
 
     # Pass 3: download to container disk (slow path — only on cold cache).
@@ -164,6 +168,7 @@ def ensure_model() -> str:
     downloaded = hf_hub_download(repo_id=MODEL_REPO, filename=MODEL_FILE, local_dir=MODEL_DIR)
     size_gb = os.path.getsize(downloaded) / (1024 ** 3)
     print(f"[download complete] {downloaded} ({size_gb:.1f} GB)")
+    globals()["_MODEL_SOURCE"] = "download"
     return downloaded
 
 
@@ -275,11 +280,19 @@ _FIRST_JOB_RECEIVED = None
 
 def _build_meta():
     """Diagnostic metadata attached to every response."""
+    diag = INIT_DIAG or {}
     meta = {
         "phase_times": dict(PHASE_TIMES),
         "first_job_received_s": _FIRST_JOB_RECEIVED,
         "uptime_at_response_s": round(time.monotonic() - _MODULE_START, 3),
-        "gpu": (INIT_DIAG or {}).get("nvidia_smi", "?"),
+        "gpu": diag.get("nvidia_smi", "?"),
+        # Cache visibility — confirms whether RunPod Cached Models populated
+        # the host-local cache and which storage the model loaded from.
+        "hf_cache_root_exists": diag.get("hf_cache_root_exists"),
+        "hf_cache_contents": diag.get("hf_cache_contents"),
+        "model_source": _MODEL_SOURCE,
+        "disk_root_free_gb": diag.get("disk_root_free_gb"),
+        "volume_exists": diag.get("volume_exists"),
     }
     return meta
 
